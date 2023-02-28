@@ -46,6 +46,8 @@
 
 static char ids[1024] __initdata;
 
+static u32 xtsc_khz;
+
 module_param_string(ids, ids, sizeof(ids), 0);
 MODULE_PARM_DESC(ids, "Initial PCI IDs to add to the driver, format is "
                  "\"vendor:device[:subvendor[:subdevice[:class[:class_mask]]]]\""
@@ -263,6 +265,13 @@ static struct pci_driver pcielat_driver = {
  * intel ia-32 and ia-64 instruction set architectures,
  * White paper, Intel Corporation."
  */
+#ifdef __aarch64__
+#define get_tsc(tsc) 					\
+	asm volatile("isb" : : : "memory"); 		\
+	asm volatile("mrs %0, cntvct_el0" : "=r" (tsc));
+#define get_tsc_freq(freq)				\
+	asm volatile("mrs %0, cntfrq_el0" : "=r" (freq));
+#else
 #define get_tsc_top(high, low)				\
 	asm volatile ("cpuid         \n\t"		\
 		      "rdtsc         \n\t"		\
@@ -270,8 +279,7 @@ static struct pci_driver pcielat_driver = {
 		      "mov %%eax, %1 \n\t"		\
 		      :"=r" (high), "=r"(low)		\
 		      :					\
-		      :"rax", "rbx", "rcx", "rdx");	\
-
+		      :"rax", "rbx", "rcx", "rdx");
 #define get_tsc_bottom(high, low)			\
 	asm volatile ("rdtscp \n\t"			\
 		      "mov %%edx, %0 \n\t"		\
@@ -279,14 +287,17 @@ static struct pci_driver pcielat_driver = {
 		      "cpuid \n\t"			\
 		      :"=r" (high), "=r"(low)		\
 		      :					\
-		      :"rax", "rbx", "rcx", "rdx");	\
+		      :"rax", "rbx", "rcx", "rdx");
+#endif
 
 static void do_benchmark(void __iomem *addr, u32 bar_offset, unsigned int loops,
 			 struct result_data_t *result_data)
 {
 	unsigned long flags;
+#ifndef __aarch64__
 	u32 tsc_high_before, tsc_high_after;
 	u32 tsc_low_before, tsc_low_after;
+#endif //__arch64__
 	u64 tsc_start, tsc_end, tsc_diff;
 	unsigned int i;
 
@@ -294,10 +305,17 @@ static void do_benchmark(void __iomem *addr, u32 bar_offset, unsigned int loops,
 	 * "Warmup" of the benchmarking code.
 	 * This will put instructions into cache.
 	 */
+#ifdef __aarch64__
+	get_tsc(tsc_start);
+	get_tsc(tsc_end);
+	get_tsc(tsc_start);
+	get_tsc(tsc_end);
+#else
 	get_tsc_top(tsc_high_before, tsc_low_before);
 	get_tsc_bottom(tsc_high_after, tsc_low_after);
 	get_tsc_top(tsc_high_before, tsc_low_before);
 	get_tsc_bottom(tsc_high_after, tsc_low_after);
+#endif //__aarch64__
 
         /* Main latency measurement loop */
 	for (i = 0; i < loops; i++) {
@@ -305,20 +323,30 @@ static void do_benchmark(void __iomem *addr, u32 bar_offset, unsigned int loops,
 		preempt_disable();
 		raw_local_irq_save(flags);
 
+#ifdef __aarch64__
+		get_tsc(tsc_start);
+#else
 		get_tsc_top(tsc_high_before, tsc_low_before);
+#endif //__aarch64__
 
 		/*** Function to measure execution time for ***/
 		readl(addr + bar_offset);
 		/***************************************/
 
+#ifdef __aarch64__
+		get_tsc(tsc_end);
+#else
 		get_tsc_bottom(tsc_high_after, tsc_low_after);
+#endif //__aarch64__
 
 		raw_local_irq_restore(flags);
 		preempt_enable();
 
 		/* Calculate delta */
+#ifndef __aarch64__
 		tsc_start = ((u64) tsc_high_before << 32) | tsc_low_before;
 		tsc_end = ((u64) tsc_high_after << 32) | tsc_low_after;
+#endif //__aarch64__
 	        tsc_diff = tsc_end - tsc_start;
 
 		result_data[i].tsc_start  = tsc_start;
@@ -331,15 +359,28 @@ static void do_benchmark(void __iomem *addr, u32 bar_offset, unsigned int loops,
 
 static unsigned int __init get_tsc_overhead(void)
 {
-	unsigned long flags, sum;
+	unsigned long flags;
+	u64 sum;
+#ifdef __aarch64__
+	u64 tsc_start, tsc_end;
+#else
 	u32 tsc_high_before, tsc_high_after;
 	u32 tsc_low_before, tsc_low_after;
+#endif //__aarch64__
 	unsigned int i;
 
+
+#ifdef __aarch64__
+	get_tsc(tsc_start);
+	get_tsc(tsc_end);
+	get_tsc(tsc_start);
+	get_tsc(tsc_end);
+#else
 	get_tsc_top(tsc_high_before, tsc_low_before);
 	get_tsc_bottom(tsc_high_after, tsc_low_after);
 	get_tsc_top(tsc_high_before, tsc_low_before);
 	get_tsc_bottom(tsc_high_after, tsc_low_after);
+#endif //__aarch64__
 
 	sum = 0;
 	for (i = 0; i < OVERHEAD_MEASURE_LOOPS; i++) {
@@ -347,14 +388,20 @@ static unsigned int __init get_tsc_overhead(void)
 		preempt_disable();
 		raw_local_irq_save(flags);
 
+#ifdef __aarch64__
+		get_tsc(tsc_start);
+		get_tsc(tsc_end);
+	        sum += tsc_end - tsc_start;
+#else
 		get_tsc_top(tsc_high_before, tsc_low_before);
 		get_tsc_bottom(tsc_high_after, tsc_low_after);
+		/* Calculate delta; lower 32 Bit should be enough here */
+	        sum += tsc_low_after - tsc_low_before;
+#endif //__aarch64__
 
 		raw_local_irq_restore(flags);
 		preempt_enable();
 
-		/* Calculate delta; lower 32 Bit should be enough here */
-	        sum += tsc_low_after - tsc_low_before;
 	}
 
 	return sum / OVERHEAD_MEASURE_LOOPS;
@@ -367,7 +414,7 @@ static ssize_t pcielat_tsc_freq_show(struct device *dev,
 				     struct device_attribute *attr,
 				     char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", tsc_khz * 1000LLU);
+	return scnprintf(buf, PAGE_SIZE, "%llu\n", xtsc_khz * 1000LLU);
 }
 
 static ssize_t pcielat_tsc_overhead_show(struct device *dev,
@@ -540,6 +587,7 @@ static char *pci_char_devnode(struct device *dev, umode_t *mode)
 			 PCI_FUNC(pdev->devfn));
 }
 
+#ifndef __aarch64__
 static int check_tsc_invariant(void)
 {
 	uint32_t edx;
@@ -581,18 +629,29 @@ static int check_tsc_invariant(void)
 		return 0;
 	}
 }
+#endif //__aarch64__
 
 static int __init pci_init(void)
 {
 	int err;
 	char *p, *id;
+	/* Initialize xtsc_khz in an arch specific manner */
+#ifdef __aarch64__
+	u64 freq;
+	get_tsc_freq(freq);
+	xtsc_khz = freq/1000;
+#else
+	xtsc_khz = tsc_khz;
+#endif //__aarch64__
 
 	/* Check if host is capable of benchmarking with TSC */
+#ifndef __aarch64__
 	if (!check_tsc_invariant())
 		return  -EPERM;
+#endif //__aarch64__
 
 	/* Print TSC frequency as measured from the kernel boot routines */
-	pr_info(DRIVER_NAME ": TSC frequency: %d kHz\n", tsc_khz);
+	pr_info(DRIVER_NAME ": TSC frequency: %d kHz\n", xtsc_khz);
 
 	/* calculate TSC overhead of the system */
 	tsc_overhead = get_tsc_overhead();

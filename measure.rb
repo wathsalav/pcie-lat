@@ -30,6 +30,7 @@ DRIVER_NAME = "pcie-lat"
 MODULE      = "/sys/bus/pci/drivers/#{DRIVER_NAME}"
 
 bdf = nil
+rbdf = nil
 
 opts = {
   "target_bar" => 0,
@@ -40,8 +41,10 @@ opts = {
 parser = OptionParser.new do |options|
   options.banner = "Usage: #{$0} [options]"
 
-  options.on('-p', '--pci B:D:F', 'B:D:F of PCIe device, e.g. 00:05.0') do |_bdf|
-    _bdf = _bdf[0..6]
+  options.on('-p', '--pci R:B:D:F', 'R:B:D:F of PCIe device, e.g. 0000:00:05.0') do |_irbdf|
+    _rbdf = _irbdf[0..11]
+    _bdf = _irbdf[5..11]
+    rbdf = _rbdf if _rbdf =~ /\h\h\h\h:\h\h\:\h\h\.\h/
     bdf = _bdf if _bdf =~ /\h\h\:\h\h\.\h/
   end
 
@@ -79,16 +82,17 @@ unless File.exist?(MODULE)
   exit
 end
 
-if bdf.nil?
+if rbdf.nil?
   puts "No PCIe device specified."
   puts "Do with ./#{$0} -p 00:05.0"
   exit
 end
 
-SYSFS_PATH   = "/sys/bus/pci/devices/0000:#{bdf}/#{DRIVER_NAME}/#{bdf}/pcielat_"
+SYSFS_PATH   = "/sys/bus/pci/devices/#{rbdf}/#{DRIVER_NAME}/#{bdf}/pcielat_"
 CHARDEV_FILE = "/dev/#{DRIVER_NAME}/#{bdf}"
 
 unless File.chardev?(CHARDEV_FILE)
+  puts "--- #{bdf} ---"
   puts "chardev file does not exist."
   puts "Device bound to #{DRIVER_NAME} driver?"
   exit
