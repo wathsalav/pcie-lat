@@ -31,11 +31,14 @@ MODULE      = "/sys/bus/pci/drivers/#{DRIVER_NAME}"
 
 bdf = nil
 dbdf = nil
+tsc_overhead = 0
+tsc_freq = 0
 
 opts = {
   "target_bar" => 0,
   "bar_offset" => 0,
-  "loops"      => 100000
+  "loops"      => 100000,
+  "core"       => 0
 }
 
 parser = OptionParser.new do |options|
@@ -68,6 +71,11 @@ parser = OptionParser.new do |options|
     opts["loops"] = loops if loops > 0
   end
 
+  options.on('-c', '--core n', 'The core the measrements are taken from. Default 0') do |core|
+    core = core.to_i
+    opts["core"] = core if core >= 0
+  end
+
   options.on('-h', '--help', 'Displays Help') do
     puts options
     exit
@@ -98,10 +106,6 @@ unless File.chardev?(CHARDEV_FILE)
   exit
 end
 
-# Get TSC frequency and measurement routine overhead
-# from kernel module
-tsc_freq     = File.read(SYSFS_PATH + "tsc_freq").to_f
-tsc_overhead = File.read(SYSFS_PATH + "tsc_overhead").to_i
 
 # Write options specified in command line arguments
 # to kernel module
@@ -111,13 +115,15 @@ opts.each do |key, value|
   end
 end
 
-puts "TSC freq:     #{tsc_freq} Hz"
-puts "TSC overhead: #{tsc_overhead} cycles"
+#puts "TSC freq:     #{opts["tsc_freq"]} Hz"
+#puts "TSC overhead: #{opts["tsc_overhead"]} cycles"
 puts "Device:       #{bdf}"
 puts "BAR:          #{opts["target_bar"]}"
 puts "Offset:       0x%x" % opts["bar_offset"]
 puts "Loops:        #{opts["loops"]}"
+puts "Core:         #{opts["core"]}"
 puts ""
+
 
 # measure
 begin
@@ -135,6 +141,12 @@ File.open(CHARDEV_FILE) do |f|
     res << m.unpack('QQ')
   end
 end
+
+tsc_overhead = File.read(SYSFS_PATH + 'tsc_overhead').to_i
+tsc_freq = File.read(SYSFS_PATH + 'tsc_freq').to_i
+
+puts "TSC overhead : "+"#{tsc_overhead}"
+puts "TSC freq : "+"#{tsc_freq}"
 
 # Subtract measurement routine overhead and
 # make tsc timestamps relative to first measurement
