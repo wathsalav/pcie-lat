@@ -30,18 +30,24 @@ DRIVER_NAME = "pcie-lat"
 MODULE      = "/sys/bus/pci/drivers/#{DRIVER_NAME}"
 
 bdf = nil
+dbdf = nil
+tsc_overhead = 0
+tsc_freq = 0
 
 opts = {
   "target_bar" => 0,
   "bar_offset" => 0,
-  "loops"      => 100000
+  "loops"      => 100000,
+  "core"       => 0
 }
 
 parser = OptionParser.new do |options|
   options.banner = "Usage: #{$0} [options]"
 
-  options.on('-p', '--pci B:D:F', 'B:D:F of PCIe device, e.g. 00:05.0') do |_bdf|
-    _bdf = _bdf[0..6]
+  options.on('-p', '--pci R:B:D:F', 'R:B:D:F of PCIe device, e.g. 0000:00:05.0') do |_idbdf|
+    _dbdf = _idbdf[0..11]
+    _bdf = _idbdf[5..11]
+    dbdf = _dbdf if _dbdf =~ /\h\h\h\h:\h\h\:\h\h\.\h/
     bdf = _bdf if _bdf =~ /\h\h\:\h\h\.\h/
   end
 
@@ -65,6 +71,11 @@ parser = OptionParser.new do |options|
     opts["loops"] = loops if loops > 0
   end
 
+  options.on('-c', '--core n', 'The core the measrements are taken from. Default 0') do |core|
+    core = core.to_i
+    opts["core"] = core if core >= 0
+  end
+
   options.on('-h', '--help', 'Displays Help') do
     puts options
     exit
@@ -79,25 +90,22 @@ unless File.exist?(MODULE)
   exit
 end
 
-if bdf.nil?
+if dbdf.nil?
   puts "No PCIe device specified."
   puts "Do with ./#{$0} -p 00:05.0"
   exit
 end
 
-SYSFS_PATH   = "/sys/bus/pci/devices/0000:#{bdf}/#{DRIVER_NAME}/#{bdf}/pcielat_"
+SYSFS_PATH   = "/sys/bus/pci/devices/#{dbdf}/#{DRIVER_NAME}/#{bdf}/pcielat_"
 CHARDEV_FILE = "/dev/#{DRIVER_NAME}/#{bdf}"
 
 unless File.chardev?(CHARDEV_FILE)
+  puts "--- #{bdf} ---"
   puts "chardev file does not exist."
   puts "Device bound to #{DRIVER_NAME} driver?"
   exit
 end
 
-# Get TSC frequency and measurement routine overhead
-# from kernel module
-tsc_freq     = File.read(SYSFS_PATH + "tsc_freq").to_f
-tsc_overhead = File.read(SYSFS_PATH + "tsc_overhead").to_i
 
 # Write options specified in command line arguments
 # to kernel module
@@ -107,13 +115,15 @@ opts.each do |key, value|
   end
 end
 
-puts "TSC freq:     #{tsc_freq} Hz"
-puts "TSC overhead: #{tsc_overhead} cycles"
+#puts "TSC freq:     #{opts["tsc_freq"]} Hz"
+#puts "TSC overhead: #{opts["tsc_overhead"]} cycles"
 puts "Device:       #{bdf}"
 puts "BAR:          #{opts["target_bar"]}"
 puts "Offset:       0x%x" % opts["bar_offset"]
 puts "Loops:        #{opts["loops"]}"
+puts "Core:         #{opts["core"]}"
 puts ""
+
 
 # measure
 begin
@@ -131,6 +141,12 @@ File.open(CHARDEV_FILE) do |f|
     res << m.unpack('QQ')
   end
 end
+
+tsc_overhead = File.read(SYSFS_PATH + 'tsc_overhead').to_i
+tsc_freq = File.read(SYSFS_PATH + 'tsc_freq').to_i
+
+puts "TSC overhead : "+"#{tsc_overhead}"
+puts "TSC freq : "+"#{tsc_freq}"
 
 # Subtract measurement routine overhead and
 # make tsc timestamps relative to first measurement

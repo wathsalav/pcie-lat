@@ -38,6 +38,12 @@
 #include <linux/uaccess.h>
 #include <linux/delay.h>
 #include <linux/vmalloc.h>
+#include <linux/smp.h>
+#include <linux/cpufreq.h>
+
+#ifdef __aarch64__
+#include <linux/perf/arm_pmu.h>
+#endif //__aarach64__
 
 #define DRIVER_NAME "pcie-lat"
 #define LOOPS_UPPER_LIMIT	10000000
@@ -45,6 +51,7 @@
 #define OVERHEAD_MEASURE_LOOPS	1000000
 
 static char ids[1024] __initdata;
+static u32 xtsc_khz;
 
 module_param_string(ids, ids, sizeof(ids), 0);
 MODULE_PARM_DESC(ids, "Initial PCI IDs to add to the driver, format is "
@@ -67,6 +74,7 @@ struct bar_t {
 struct options_t {
 	unsigned int loops;
 	unsigned char target_bar;
+	u32 cpu_id;
 	u32 bar_offset;
 };
 
@@ -254,15 +262,29 @@ static struct pci_driver pcielat_driver = {
 };
 
 /*
- * The following code implements PCIe latency measurement by
+ * The following codeimplements PCIe latency measurement by
  * benchmarking the time it takes to complete a readl() to a user
  * specified BAR and offset within this BAR.
  *
  * Time is measured via the TSC and implemented according to
  * "G. Paoloni, How to benchmark code execution times on
  * intel ia-32 and ia-64 instruction set architectures,
- * White paper, Intel Corporation."
+ * White paper, Intel Corporation." for x86 architecture.
+ *
+ * Time is measured via the PMU cycle counter for aarch64
+ * architecture.
  */
+
+#ifdef __aarch64__
+#define get_pmc_tsc(tsc)				\
+	asm volatile("isb" : : : "memory"); 		\
+        asm volatile("mrs %0, pmccntr_el0" : "=r" (tsc));
+#define get_tsc(tsc)					\
+	asm volatile("isb" : : : "memory"); 		\
+        asm volatile("mrs %0, cntvct_el0" : "=r" (tsc));
+#define get_tsc_freq(freq)				\
+	asm volatile("mrs %0, cntfrq_el0" : "=r" (freq));
+#else
 #define get_tsc_top(high, low)				\
 	asm volatile ("cpuid         \n\t"		\
 		      "rdtsc         \n\t"		\
@@ -270,8 +292,7 @@ static struct pci_driver pcielat_driver = {
 		      "mov %%eax, %1 \n\t"		\
 		      :"=r" (high), "=r"(low)		\
 		      :					\
-		      :"rax", "rbx", "rcx", "rdx");	\
-
+		      :"rax", "rbx", "rcx", "rdx");
 #define get_tsc_bottom(high, low)			\
 	asm volatile ("rdtscp \n\t"			\
 		      "mov %%edx, %0 \n\t"		\
@@ -279,85 +300,176 @@ static struct pci_driver pcielat_driver = {
 		      "cpuid \n\t"			\
 		      :"=r" (high), "=r"(low)		\
 		      :					\
-		      :"rax", "rbx", "rcx", "rdx");	\
+		      :"rax", "rbx", "rcx", "rdx");
+#endif
 
-static void do_benchmark(void __iomem *addr, u32 bar_offset, unsigned int loops,
-			 struct result_data_t *result_data)
+#ifdef __aarch64__
+static void start_pmu_cycle_counter(void)
 {
-	unsigned long flags;
-	u32 tsc_high_before, tsc_high_after;
-	u32 tsc_low_before, tsc_low_after;
-	u64 tsc_start, tsc_end, tsc_diff;
+	u64 cval;
+	cval = read_sysreg(pmcr_el0);
+	pr_info("pmcr_el0: %llx\n", cval);
+	cval |= 0x01;
+	write_sysreg(cval, pmcr_el0);
+	cval = read_sysreg(pmcntenset_el0);
+	pr_info("pmcntenset_el0: %llx\n", cval);
+	cval |= 0x01 << 31;
+	write_sysreg(cval, pmcntenset_el0);
+}
+
+static void stop_pmu_cycle_counter(void *arg)
+{
+	u64 cval;
+	cval = read_sysreg(pmcr_el0);
+	cval &= ~0x01;
+	write_sysreg(cval, pmcr_el0);
+	cval = read_sysreg(pmcntenset_el0);
+	cval &= ~(0x01 << 31);
+	write_sysreg(cval, pmcntenset_el0);
+}
+#endif //__aarch64__
+
+static unsigned int __init get_tsc_overhead(void)
+{
+	u64 sum;
 	unsigned int i;
 
+#if defined(__x86_64__) || defined(__i386__)
+	u32 cpu_id;
+	u32 tsc_high_before, tsc_high_after;
+	u32 tsc_low_before, tsc_low_after;
+	cpu_id = get_cpu();
+#elif defined(__aarch64__)
+	u64 tsc_start, tsc_end;
+#else
+#error Unsupported architecture
+#endif //__x86_64__ || __i386__
+
+
+#if defined(__x86_64__) || defined(__i386__)
+	get_tsc_top(tsc_high_before, tsc_low_before);
+	get_tsc_bottom(tsc_high_after, tsc_low_after);
+	get_tsc_top(tsc_high_before, tsc_low_before);
+	get_tsc_bottom(tsc_high_after, tsc_low_after);
+#elif defined(__aarch64__)
+        get_pmc_tsc(tsc_start);
+        get_pmc_tsc(tsc_end);
+        get_pmc_tsc(tsc_start);
+        get_pmc_tsc(tsc_end);
+#else
+#error Unsupported architecture
+#endif //__x86_64__ || __i386__
+
+	sum = 0;
+	for (i = 0; i < OVERHEAD_MEASURE_LOOPS; i++) {
+#if defined(__x86_64__) || defined(__i386__)
+		get_tsc_top(tsc_high_before, tsc_low_before);
+		get_tsc_bottom(tsc_high_after, tsc_low_after);
+		/* Calculate delta; lower 32 Bit should be enough here */
+	        sum += tsc_low_after - tsc_low_before;
+#elif defined(__aarch64__)
+	        get_pmc_tsc(tsc_start);
+	        get_pmc_tsc(tsc_end);
+	        sum += tsc_end - tsc_start;
+#else
+#error Unsupported architecture
+#endif //__x86_64__ || __i386__
+	}
+
+#if defined(__x86_64__) || defined(__i386__)
+	put_cpu();
+#endif //__x86_64__ || __i386__
+
+#ifdef __aarch64__
+#endif //__aarch64__
+	return sum / OVERHEAD_MEASURE_LOOPS;
+}
+
+
+static void do_benchmark(void *arg)
+{
+	unsigned long flags;
+	u64 tsc_start, tsc_end, tsc_diff;
+	unsigned int i;
+	struct pcielat_priv *priv = (struct pcielat_priv*)arg;
+	void __iomem *pcie_addr = priv->bar[priv->options.target_bar].addr + priv->options.bar_offset;
+	
+#if defined(__x86_64__) || defined(__i386__)
+	u32 tsc_high_before, tsc_high_after;
+	u32 tsc_low_before, tsc_low_after;
+#elif defined(__aarch64__)
+	start_pmu_cycle_counter();
+	preempt_disable();
+	raw_local_irq_save(flags);
+	tsc_overhead = get_tsc_overhead();
+	raw_local_irq_restore(flags);
+	preempt_enable();
+#else
+#error Unsupported architecture
+#endif //__x86_64__ || __i386__
 	/*
 	 * "Warmup" of the benchmarking code.
 	 * This will put instructions into cache.
 	 */
+#if defined(__x86_64__) || defined(__i386__)
 	get_tsc_top(tsc_high_before, tsc_low_before);
 	get_tsc_bottom(tsc_high_after, tsc_low_after);
 	get_tsc_top(tsc_high_before, tsc_low_before);
 	get_tsc_bottom(tsc_high_after, tsc_low_after);
+#elif defined(__aarch64__)
+	get_pmc_tsc(tsc_start);
+	get_pmc_tsc(tsc_end);
+	get_pmc_tsc(tsc_start);
+	get_pmc_tsc(tsc_end);
+#else
+#error Unsupported architecture
+#endif //__x86_64__ || __i386__
 
         /* Main latency measurement loop */
-	for (i = 0; i < loops; i++) {
+	for (i = 0; i < priv->options.loops; i++) {
 
 		preempt_disable();
 		raw_local_irq_save(flags);
-
+#if defined(__x86_64__) || defined(__i386__)
 		get_tsc_top(tsc_high_before, tsc_low_before);
+#elif defined(__aarch64__)
+		get_pmc_tsc(tsc_start);
+#else
+#error Unsupported architecture
+#endif //__x86_64__ || __i386__
 
 		/*** Function to measure execution time for ***/
-		readl(addr + bar_offset);
+		//readl(priv->bar[priv->options.target_bar].addr + priv->options.bar_offset);
+		readl(pcie_addr);
 		/***************************************/
 
+#if defined(__x86_64__) || defined(__i386__)
 		get_tsc_bottom(tsc_high_after, tsc_low_after);
+#elif defined(__aarch64__)
+		get_pmc_tsc(tsc_end);
+#else
+#error Unsupported architecture
+#endif //__x86_64__ || __i386__
 
 		raw_local_irq_restore(flags);
 		preempt_enable();
 
 		/* Calculate delta */
+#if defined(__x86_64__) || defined(__i386__)
 		tsc_start = ((u64) tsc_high_before << 32) | tsc_low_before;
 		tsc_end = ((u64) tsc_high_after << 32) | tsc_low_after;
+#endif //__x86_64__ || __i386__
 	        tsc_diff = tsc_end - tsc_start;
 
-		result_data[i].tsc_start  = tsc_start;
-		result_data[i].tsc_diff   = tsc_diff;
+		priv->result_data[i].tsc_start  = tsc_start;
+		priv->result_data[i].tsc_diff   = tsc_diff;
 
 		/* Short delay to ensure we don't DoS the device */
 		ndelay(800);
 	}
-}
-
-static unsigned int __init get_tsc_overhead(void)
-{
-	unsigned long flags, sum;
-	u32 tsc_high_before, tsc_high_after;
-	u32 tsc_low_before, tsc_low_after;
-	unsigned int i;
-
-	get_tsc_top(tsc_high_before, tsc_low_before);
-	get_tsc_bottom(tsc_high_after, tsc_low_after);
-	get_tsc_top(tsc_high_before, tsc_low_before);
-	get_tsc_bottom(tsc_high_after, tsc_low_after);
-
-	sum = 0;
-	for (i = 0; i < OVERHEAD_MEASURE_LOOPS; i++) {
-
-		preempt_disable();
-		raw_local_irq_save(flags);
-
-		get_tsc_top(tsc_high_before, tsc_low_before);
-		get_tsc_bottom(tsc_high_after, tsc_low_after);
-
-		raw_local_irq_restore(flags);
-		preempt_enable();
-
-		/* Calculate delta; lower 32 Bit should be enough here */
-	        sum += tsc_low_after - tsc_low_before;
-	}
-
-	return sum / OVERHEAD_MEASURE_LOOPS;
+#ifdef __aarch64__
+	stop_pmu_cycle_counter(&(priv->options.cpu_id));
+#endif //__aarch64__
 }
 
 /*
@@ -367,7 +479,7 @@ static ssize_t pcielat_tsc_freq_show(struct device *dev,
 				     struct device_attribute *attr,
 				     char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", tsc_khz * 1000LLU);
+	return scnprintf(buf, PAGE_SIZE, "%llu\n", xtsc_khz * 1000LLU);
 }
 
 static ssize_t pcielat_tsc_overhead_show(struct device *dev,
@@ -469,12 +581,32 @@ static ssize_t pcielat_bar_offset_store(struct device *dev,
 	return count;
 }
 
+static ssize_t pcielat_core_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct pcielat_priv *priv = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", priv->options.cpu_id);
+}
+
+static ssize_t pcielat_core_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct pcielat_priv *priv = dev_get_drvdata(dev);
+
+	sscanf(buf, "%u", &priv->options.cpu_id);
+
+	return count;
+}
+
 static ssize_t pcielat_measure_store(struct device *dev,
 				     struct device_attribute *attr,
 				     const char *buf, size_t count)
 {
 	struct pcielat_priv *priv = dev_get_drvdata(dev);
 	int target_bar_len;
+	u32 _xtsc_khz;
 
 	if (priv->options.loops == 0) {
 		dev_info(dev, "Loop count for measurements not set!\n");
@@ -496,15 +628,22 @@ static ssize_t pcielat_measure_store(struct device *dev,
 		return -EINVAL;
 	}
 
-	do_benchmark(priv->bar[priv->options.target_bar].addr,
-		     priv->options.bar_offset,
-		     priv->options.loops,
-		     priv->result_data);
+	_xtsc_khz = cpufreq_get(priv->options.cpu_id);
+	/* there is no observer for xtsc_khz below this point, we don't want
+	 * run do_benchmark on the target core before we set xtsc_khz.
+	 */
+	xtsc_khz = smp_load_acquire(&_xtsc_khz);
 
-	dev_info(dev, "Benchmark done with %d measure_loops for BAR%d, offset 0x%08x\n",
+	if ((smp_call_function_single(priv->options.cpu_id, do_benchmark, priv, true)) < 0) {
+		pr_err("Failed launching do_benchmark() on core %u\n", priv->options.cpu_id);
+		return -EINVAL;
+	}
+
+	dev_info(dev, "Benchmark done with %d measure_loops for BAR%d, offset 0x%08x on CPU %d\n",
 		 priv->options.loops,
 		 priv->options.target_bar,
-		 priv->options.bar_offset);
+		 priv->options.bar_offset,
+		 priv->options.cpu_id);
 
 	return count;
 }
@@ -515,6 +654,7 @@ static DEVICE_ATTR_RW(pcielat_loops);
 static DEVICE_ATTR_RW(pcielat_target_bar);
 static DEVICE_ATTR_RW(pcielat_bar_offset);
 static DEVICE_ATTR_WO(pcielat_measure);
+static DEVICE_ATTR_RW(pcielat_core);
 
 static struct attribute *pcielat_attrs[] = {
 	&dev_attr_pcielat_tsc_freq.attr,
@@ -523,6 +663,7 @@ static struct attribute *pcielat_attrs[] = {
 	&dev_attr_pcielat_target_bar.attr,
 	&dev_attr_pcielat_bar_offset.attr,
 	&dev_attr_pcielat_measure.attr,
+	&dev_attr_pcielat_core.attr,
 	NULL,
 };
 
@@ -540,6 +681,7 @@ static char *pci_char_devnode(struct device *dev, umode_t *mode)
 			 PCI_FUNC(pdev->devfn));
 }
 
+#ifndef __aarch64__
 static int check_tsc_invariant(void)
 {
 	uint32_t edx;
@@ -581,22 +723,26 @@ static int check_tsc_invariant(void)
 		return 0;
 	}
 }
+#endif //__aarch64__
 
 static int __init pci_init(void)
 {
 	int err;
 	char *p, *id;
-
+	/* Initialize xtsc_khz in an arch specific manner */
+#if defined(__x86_64__) || defined(__i386__)
+	xtsc_khz = tsc_khz;
 	/* Check if host is capable of benchmarking with TSC */
 	if (!check_tsc_invariant())
 		return  -EPERM;
-
 	/* Print TSC frequency as measured from the kernel boot routines */
-	pr_info(DRIVER_NAME ": TSC frequency: %d kHz\n", tsc_khz);
-
-	/* calculate TSC overhead of the system */
+	pr_info(DRIVER_NAME ": TSC frequency: %d kHz\n", xtsc_khz);
 	tsc_overhead = get_tsc_overhead();
+	/* calculate TSC overhead of the system */
 	pr_info(DRIVER_NAME ": Overhead of TSC measurement: %d cycles\n", tsc_overhead);
+#endif ///__x86_64__ || __i386__
+
+
 
 	pcielat_class = class_create(THIS_MODULE, DRIVER_NAME);
 	if (IS_ERR(pcielat_class)) {
@@ -645,6 +791,7 @@ static int __init pci_init(void)
 	return 0;
 
 failure_register_driver:
+	pr_err("FAILED\n");
 	class_destroy(pcielat_class);
 
 	return err;
